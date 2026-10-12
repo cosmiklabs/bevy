@@ -477,7 +477,7 @@ impl Plugin for GpuMeshPreprocessPlugin {
                 Core3dShadows,
                 (
                     (
-                        allocate_uniforms,
+                        clear_indirect_parameters_metadata,
                         unpack_bins,
                         early_gpu_preprocess,
                         early_prepass_build_indirect_parameters.run_if(any_match_filter::<(
