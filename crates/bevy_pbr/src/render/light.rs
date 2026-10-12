@@ -2236,7 +2236,7 @@ fn create_point_shadow_maps(
                 face_index,
             },
             (*light_render_layers).clone(),
-            RootNonCameraView(Core3d.intern()),
+            RootNonCameraView(Core3dShadows.intern()),
         ));
 
         if !matches!(
@@ -2329,7 +2329,7 @@ fn create_spot_shadow_map(
             light_entity: *light_entity,
         },
         (*light_render_layers).clone(),
-        RootNonCameraView(Core3d.intern()),
+        RootNonCameraView(Core3dShadows.intern()),
     ));
 
     if !matches!(
