@@ -386,6 +386,7 @@ impl Plugin for PbrPlugin {
                 ExtractSchedule,
                 (
                     extract_lights,
+                    extract_shadow_caster_changes,
                     extract_ambient_light_resource,
                     extract_ambient_light,
                     extract_shadow_filtering_method,
@@ -399,6 +400,9 @@ impl Plugin for PbrPlugin {
                     prepare_lights
                         .in_set(RenderSystems::CreateViews)
                         .after(sort_cameras),
+                    skip_unchanged_shadow_views
+                        .in_set(RenderSystems::CreateViews)
+                        .after(prepare_lights),
                     prepare_clusters_for_cpu_clustering
                         .in_set(RenderSystems::PrepareResources)
                         .run_if(
@@ -411,6 +415,7 @@ impl Plugin for PbrPlugin {
             .init_gpu_resource::<LightMeta>()
             .init_gpu_resource::<RenderMaterialBindings>()
             .init_resource::<RenderShadowLodOrigin>()
+            .init_resource::<ShadowCasterChanges>()
             .allow_ambiguous_resource::<RenderMaterialBindings>();
 
         render_app.world_mut().add_observer(add_light_view_entities);
