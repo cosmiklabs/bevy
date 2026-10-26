@@ -127,8 +127,13 @@ fn pbr_input_from_standard_material(
 @if(VERTEX_UVS)
 pbr_input.material.uv_transform = uv_transform;
 
+// Each texture reads the UV channel its material selects. A mesh may have
+// either channel without the other: a texture on the missing channel reads the
+// one the mesh has.
 @if(VERTEX_UVS && VERTEX_UVS_A)
     var uv = (uv_transform * vec3(in.uv, 1.0)).xy;
+@elif(VERTEX_UVS)
+    var uv = (uv_transform * vec3(in.uv_b, 1.0)).xy;
 
 // TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass
 @if(VERTEX_UVS && VERTEX_UVS_B)
@@ -157,7 +162,6 @@ pbr_input.material.uv_transform = uv_transform;
         let max_relief_mapping_search_steps = pbr_bindings::material_array[material_indices[slot].material].max_relief_mapping_search_steps;
         @else
         let max_relief_mapping_search_steps = pbr_bindings::material.max_relief_mapping_search_steps;
-@if(VERTEX_UVS_A) {
         // TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass
         uv = parallaxed_uv(
             parallax_depth_scale,
@@ -170,7 +174,6 @@ pbr_input.material.uv_transform = uv_transform;
             -Vt,
             slot,
         );
-}
 
 @if(VERTEX_UVS_B) {
         // TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass

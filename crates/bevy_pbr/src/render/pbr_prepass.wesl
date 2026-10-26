@@ -82,7 +82,8 @@ fn fragment(
 @if(STANDARD_MATERIAL_NORMAL_MAP) {
 
 // TODO: Transforming UVs mean we need to apply derivative chain rule for meshlet mesh material pass
-@if(STANDARD_MATERIAL_NORMAL_MAP_UV_B)
+// The channel the material selects, or the one the mesh has if it lacks that one.
+@if(VERTEX_UVS_B && (STANDARD_MATERIAL_NORMAL_MAP_UV_B || !VERTEX_UVS_A))
         let uv = (uv_transform * vec3(in.uv_b, 1.0)).xy;
 @else
         let uv = (uv_transform * vec3(in.uv, 1.0)).xy;

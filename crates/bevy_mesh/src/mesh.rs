@@ -3008,7 +3008,8 @@ impl Mesh {
 /// An enum to define which UV attribute to use for a texture.
 ///
 /// It only supports two UV attributes, [`Mesh::ATTRIBUTE_UV_0`] and
-/// [`Mesh::ATTRIBUTE_UV_1`].
+/// [`Mesh::ATTRIBUTE_UV_1`]. A mesh may have either without the other; a
+/// texture set to a channel the mesh lacks reads the one it has.
 /// The default is [`UvChannel::Uv0`].
 #[derive(Reflect, Default, Debug, Clone, PartialEq, Eq)]
 #[reflect(Default, Debug, Clone, PartialEq)]
