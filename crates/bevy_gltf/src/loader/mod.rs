@@ -2133,6 +2133,10 @@ mod test {
     use bevy_world_serialization::WorldSerializationPlugin;
 
     fn test_app(dir: Dir) -> App {
+        test_app_with_plugin(dir, crate::GltfPlugin::default())
+    }
+
+    fn test_app_with_plugin(dir: Dir, gltf_plugin: crate::GltfPlugin) -> App {
         let mut app = App::new();
         let reader = MemoryAssetReader { root: dir };
         app.register_asset_source(
@@ -2145,7 +2149,7 @@ mod test {
             AssetPlugin::default(),
             WorldSerializationPlugin,
             MeshPlugin,
-            crate::GltfPlugin::default(),
+            gltf_plugin,
         ));
 
         app.finish();
@@ -2790,5 +2794,90 @@ mod test {
         assert_eq!(settings.default_sampler, default.default_sampler);
         assert_eq!(settings.override_sampler, default.override_sampler);
         assert_eq!(settings.validate, default.validate);
+    }
+
+    /// Packs a glTF JSON document and its binary buffer into a GLB.
+    fn glb(json: &str, bin: &[u8]) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8], pad: u8) {
+            let padded = data.len().next_multiple_of(4);
+            out.extend_from_slice(&(padded as u32).to_le_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            out.resize(out.len() + padded - data.len(), pad);
+        }
+        let mut chunks = Vec::new();
+        chunk(&mut chunks, b"JSON", json.as_bytes(), b' ');
+        chunk(&mut chunks, b"BIN\0", bin, 0);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"glTF");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.extend_from_slice(&((12 + chunks.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&chunks);
+        out
+    }
+
+    #[test]
+    fn custom_vertex_attribute() {
+        use bevy_mesh::{Mesh, MeshVertexAttribute, VertexAttributeValues, VertexFormat};
+
+        const ATTRIBUTE_CUSTOM: MeshVertexAttribute =
+            MeshVertexAttribute::new("Custom", 988540917, VertexFormat::Float32x2);
+
+        let positions: [[f32; 3]; 3] = [[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]];
+        let custom: [[f32; 2]; 3] = [[0.25, 0.5], [1.5, 2.5], [-3., 4.]];
+        let mut bin = Vec::new();
+        for value in positions.as_flattened().iter().chain(custom.as_flattened()) {
+            bin.extend_from_slice(&value.to_le_bytes());
+        }
+
+        // The attribute's name in the file is `_CUSTOM`: the glTF specification
+        // requires application-specific attribute names to start with an underscore.
+        let json = r#"
+{
+    "asset": { "version": "2.0" },
+    "buffers": [{ "byteLength": 60 }],
+    "bufferViews": [
+        { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+        { "buffer": 0, "byteOffset": 36, "byteLength": 24 }
+    ],
+    "accessors": [
+        { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] },
+        { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC2" }
+    ],
+    "meshes": [{ "primitives": [{ "attributes": { "POSITION": 0, "_CUSTOM": 1 } }] }],
+    "nodes": [{ "mesh": 0 }],
+    "scene": 0,
+    "scenes": [{ "nodes": [0] }]
+}
+"#;
+
+        let dir = Dir::default();
+        dir.insert_asset(Path::new("custom.glb"), glb(json, &bin));
+        // Registered under the name as it appears in the glTF file, underscore included.
+        let mut app = test_app_with_plugin(
+            dir,
+            crate::GltfPlugin::default().add_custom_vertex_attribute("_CUSTOM", ATTRIBUTE_CUSTOM),
+        );
+        let asset_server = app.world().resource::<AssetServer>().clone();
+        let handle: Handle<Mesh> = asset_server.load(
+            GltfAssetLabel::Primitive {
+                mesh: 0,
+                primitive: 0,
+            }
+            .from_asset("custom.glb"),
+        );
+        run_app_until(&mut app, |_world| {
+            match asset_server.get_load_state(handle.id()).unwrap() {
+                LoadState::Loaded => Some(()),
+                LoadState::Failed(err) => panic!("{err}"),
+                _ => None,
+            }
+        });
+
+        let mesh = app.world().resource::<Assets<Mesh>>().get(&handle).unwrap();
+        assert_eq!(
+            mesh.attribute(ATTRIBUTE_CUSTOM),
+            Some(&VertexAttributeValues::Float32x2(custom.to_vec())),
+        );
     }
 }

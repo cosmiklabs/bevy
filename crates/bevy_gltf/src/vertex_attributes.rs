@@ -317,8 +317,12 @@ pub fn convert_attribute(
             ConversionMode::JointWeight,
             false,
         )),
-        gltf::Semantic::Extras(name) => custom_vertex_attributes
-            .get(name.as_str())
+        // The `gltf` crate strips the leading underscore from application-specific
+        // attribute names (`_FOO` becomes `Extras("FOO")`), but custom attributes are
+        // registered under their name as it appears in the glTF file, underscore
+        // included. `Semantic`'s `Display` restores the underscore.
+        gltf::Semantic::Extras(_) => custom_vertex_attributes
+            .get(semantic.to_string().as_str())
             .map(|attr| (*attr, ConversionMode::Any, false)),
         _ => None,
     } {
