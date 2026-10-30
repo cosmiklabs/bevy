@@ -1,5 +1,5 @@
 import package::render::{
-    mesh_view_types::POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE,
+    mesh_view_types::{POINT_LIGHT_FLAGS_SPOT_LIGHT_Y_NEGATIVE, POINT_LIGHT_SHADOW_MAP_SHIFT},
     mesh_view_bindings as view_bindings,
     shadow_sampling::{
         SPOT_SHADOW_TEXEL_SIZE, sample_shadow_cubemap, sample_shadow_cubemap_pcss,
@@ -46,6 +46,7 @@ fn fetch_point_shadow(
     // Projection-agnostic approach:
     let zw = -major_axis_magnitude * (*light).light_custom_data.xy + (*light).light_custom_data.zw;
     let depth = zw.x / zw.y;
+    let cube = (*light).flags >> POINT_LIGHT_SHADOW_MAP_SHIFT;
 
     // If soft shadows are enabled, use the PCSS path. Cubemaps assume a
     // left-handed coordinate space, so we have to flip the z-axis when
@@ -55,7 +56,7 @@ fn fetch_point_shadow(
             frag_ls * flip_z,
             distance_to_light,
             depth,
-            light_id,
+            cube,
             (*light).soft_shadow_size,
             frag_coord_xy,
         );
@@ -63,7 +64,7 @@ fn fetch_point_shadow(
 
     // Do the lookup, using HW PCF and comparison. Cubemaps assume a left-handed
     // coordinate space, so we have to flip the z-axis when sampling.
-    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, light_id, frag_coord_xy);
+    return sample_shadow_cubemap(frag_ls * flip_z, distance_to_light, depth, cube, frag_coord_xy);
 }
 
 fn fetch_spot_shadow(
@@ -110,7 +111,8 @@ fn fetch_spot_shadow(
     let depth = near_z / -projected_position.z;
 
     // If soft shadows are enabled, use the PCSS path.
-    let array_index = i32(light_id) + view_bindings::lights.spot_light_shadowmap_offset;
+    let array_index = i32((*light).flags >> POINT_LIGHT_SHADOW_MAP_SHIFT)
+        + view_bindings::lights.spot_light_shadowmap_offset;
     if ((*light).soft_shadow_size > 0.0) {
         return sample_shadow_map_pcss(
             shadow_uv,

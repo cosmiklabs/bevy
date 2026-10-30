@@ -147,6 +147,12 @@ bitflags::bitflags! {
     }
 }
 
+/// Where a shadow-mapped point or spot light's shadow map is kept in its GPU
+/// flags, above [`PointLightFlags`]: its slot in [`ShadowMapSlots`], the cube
+/// for a point light and, for a spot light, the layer after the directional
+/// cascades.
+pub const POINT_LIGHT_SHADOW_MAP_SHIFT: u32 = 16;
+
 #[derive(Copy, Clone, ShaderType, Default, Debug)]
 pub struct GpuDirectionalCascade {
     clip_from_world: Mat4,
@@ -1155,7 +1161,11 @@ pub fn skip_unchanged_shadow_views(
     main_entities: Query<&MainEntity>,
     bindings: Query<&ViewShadowBindings>,
     changes: Res<ShadowCasterChanges>,
-    (phases, pipeline_cache): (Res<ViewBinnedRenderPhases<Shadow>>, Res<PipelineCache>),
+    (phases, pipeline_cache, slots): (
+        Res<ViewBinnedRenderPhases<Shadow>>,
+        Res<PipelineCache>,
+        Res<ShadowMapSlots>,
+    ),
     mut rendered: Local<HashMap<RetainedViewEntity, (u64, u64)>>,
 ) {
     use core::hash::{BuildHasher, Hash, Hasher};
@@ -1174,18 +1184,28 @@ pub fn skip_unchanged_shadow_views(
     });
     let mut live = HashSet::new();
     for (view_entity, view, shadow_view, light, skipped) in &views {
-        let (light_entity, texture) = match *light {
-            LightEntity::Point { light_entity, .. } => (light_entity, textures.map(|t| t.0)),
-            LightEntity::Spot { light_entity } => (light_entity, textures.map(|t| t.1)),
+        let (light_entity, texture, slots) = match *light {
+            LightEntity::Point { light_entity, .. } => {
+                (light_entity, textures.map(|t| t.0), &slots.point)
+            }
+            LightEntity::Spot { light_entity } => {
+                (light_entity, textures.map(|t| t.1), &slots.spot)
+            }
             LightEntity::Directional { .. } => continue,
         };
         let retained = view.retained_view_entity;
         live.insert(retained);
+        let main_entity = main_entities.get(light_entity).ok();
 
         let mut hasher = FixedHasher.build_hasher();
-        // The texture and, by the pass's name, the layer it renders to.
+        // The texture and, by the pass's name, the slot it renders to, and
+        // which time the slot was given to this light: one given to another
+        // light since holds that light's map.
         texture.hash(&mut hasher);
         shadow_view.pass_name.hash(&mut hasher);
+        main_entity
+            .and_then(|main| slots.get(*main))
+            .hash(&mut hasher);
         view.viewport.hash(&mut hasher);
         // The casters queued to draw: one whose mesh, material or pipeline was
         // not ready is not queued yet.
@@ -1204,10 +1224,7 @@ pub fn skip_unchanged_shadow_views(
         }
         let view_key = hasher.finish();
 
-        let change = main_entities
-            .get(light_entity)
-            .ok()
-            .and_then(|main| changes.0.get(main));
+        let change = main_entity.and_then(|main| changes.0.get(main));
         let unchanged = settled
             && texture.is_some()
             && change.is_some_and(|change| {
@@ -1234,7 +1251,123 @@ pub fn skip_unchanged_shadow_views(
             }
         }
     }
-    rendered.retain(|retained, _| live.contains(retained));
+    // A light out of view keeps what it rendered while it holds its slot,
+    // so its map is kept when it comes back.
+    rendered.retain(|retained, _| {
+        live.contains(retained)
+            || slots.point.get(retained.main_entity).is_some()
+            || slots.spot.get(retained.main_entity).is_some()
+    });
+}
+
+/// How many slots the shadow map textures grow by: they never shrink, so how
+/// many lights cast shadows can change without giving every shadow map a new
+/// texture, and the spare slots keep lights that have left the view.
+pub const SHADOW_MAP_SLOTS_STEP: u32 = 8;
+
+/// Which slot of the shadow map textures each shadow-mapped point and spot
+/// light renders to, kept from frame to frame.
+///
+/// A light's shadow map was the slot of its index among this frame's lights, in
+/// textures sized for this frame's: a light coming into view moved the maps
+/// of every light after it, and a change in how many cast replaced both
+/// textures, so maps [`skip_unchanged_shadow_views`] could have kept were
+/// rendered again. Here a light keeps its slot while it casts, and after it
+/// leaves the view until the slot is wanted, the longest unused first.
+#[derive(Resource, Default)]
+pub struct ShadowMapSlots {
+    /// Point lights' cubes.
+    pub point: ShadowMapSlotAllocator,
+    /// Spot lights' layers, after the directional cascades.
+    pub spot: ShadowMapSlotAllocator,
+}
+
+/// The slots of one shadow map texture, and the lights holding them.
+#[derive(Default)]
+pub struct ShadowMapSlotAllocator {
+    capacity: u32,
+    held: MainEntityHashMap<HeldShadowMapSlot>,
+    frame: u64,
+    generations: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HeldShadowMapSlot {
+    slot: u32,
+    last_used: u64,
+    generation: u64,
+}
+
+impl ShadowMapSlotAllocator {
+    /// How many slots the texture has.
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
+    /// The slot `light` holds, and a number that changes whenever a slot is
+    /// given to a light, so a map rendered into it by a light before is not
+    /// taken for this one's.
+    pub fn get(&self, light: MainEntity) -> Option<(u32, u64)> {
+        self.held
+            .get(&light)
+            .map(|held| (held.slot, held.generation))
+    }
+
+    /// Gives each of `lights`, this frame's shadow-mapped lights, a slot,
+    /// keeping the one it holds, growing the texture by
+    /// [`SHADOW_MAP_SLOTS_STEP`] when they don't fit, up to `most`.
+    pub fn assign(&mut self, lights: &[MainEntity], most: u32) {
+        self.frame += 1;
+        let needed = (lights.len() as u32).min(most);
+        if needed > self.capacity {
+            self.capacity = needed.next_multiple_of(SHADOW_MAP_SLOTS_STEP).min(most);
+        }
+        self.capacity = self.capacity.min(most);
+        let capacity = self.capacity;
+        self.held.retain(|_, held| held.slot < capacity);
+
+        let frame = self.frame;
+        for light in lights.iter().take(needed as usize) {
+            if let Some(held) = self.held.get_mut(light) {
+                held.last_used = frame;
+            }
+        }
+        let mut taken = vec![false; capacity as usize];
+        for held in self.held.values() {
+            taken[held.slot as usize] = true;
+        }
+        for light in lights.iter().take(needed as usize) {
+            if self.held.contains_key(light) {
+                continue;
+            }
+            let slot = match taken.iter().position(|taken| !taken) {
+                Some(free) => free as u32,
+                // As many slots as lights this frame, so one is held by a
+                // light that isn't one of them.
+                None => {
+                    let (&evicted, held) = self
+                        .held
+                        .iter()
+                        .filter(|(_, held)| held.last_used < frame)
+                        .min_by_key(|(_, held)| held.last_used)
+                        .expect("a slot held by a light not shadow mapped this frame");
+                    let slot = held.slot;
+                    self.held.remove(&evicted);
+                    slot
+                }
+            };
+            taken[slot as usize] = true;
+            self.generations += 1;
+            self.held.insert(
+                *light,
+                HeldShadowMapSlot {
+                    slot,
+                    last_used: frame,
+                    generation: self.generations,
+                },
+            );
+        }
+    }
 }
 
 pub fn prepare_lights(
@@ -1304,9 +1437,11 @@ pub fn prepare_lights(
         Query<&mut DirectionalLightViewEntities>,
     ),
     sorted_cameras: Res<SortedCameras>,
-    (gpu_preprocessing_support, decals): (
+    (gpu_preprocessing_support, decals, mut shadow_map_slots, mut shadow_views_made_with): (
         Res<GpuPreprocessingSupport>,
         Option<Res<RenderClusteredDecals>>,
+        ResMut<ShadowMapSlots>,
+        Local<MainEntityHashMap<(u64, TextureId)>>,
     ),
     (existing_shadow_views, mut light_key_cache, mut specialized_shadow_material_pipeline_cache): (
         Query<&ShadowView>,
@@ -1488,18 +1623,45 @@ pub fn prepare_lights(
 
     global_clusterable_object_meta.gpu_clustered_lights.clear();
 
-    for (index, entity) in point_light_entities.iter().enumerate() {
-        let light = point_lights.get(*entity).unwrap().2;
-
-        let mut flags = PointLightFlags::NONE;
-
-        // Lights are sorted, shadow enabled lights are first
-        if light.shadow_maps_enabled
+    // Lights are sorted, shadow enabled lights are first
+    let shadow_mapped = |index: usize, light: &ExtractedPointLight| {
+        light.shadow_maps_enabled
             && (index < point_light_shadow_maps_count
                 || (light.spot_light_angles.is_some()
                     && index - point_light_count < spot_light_shadow_maps_count))
-        {
+    };
+    let (mut shadow_mapped_points, mut shadow_mapped_spots) = (Vec::new(), Vec::new());
+    for (index, entity) in point_light_entities.iter().enumerate() {
+        let (_, main_entity, light, ..) = point_lights.get(*entity).unwrap();
+        if shadow_mapped(index, light) {
+            match light.spot_light_angles {
+                Some(_) => shadow_mapped_spots.push(*main_entity),
+                None => shadow_mapped_points.push(*main_entity),
+            }
+        }
+    }
+    shadow_map_slots
+        .point
+        .assign(&shadow_mapped_points, max_texture_cubes as u32);
+    shadow_map_slots.spot.assign(
+        &shadow_mapped_spots,
+        (max_texture_array_layers - directional_shadow_enabled_count * MAX_CASCADES_PER_LIGHT)
+            as u32,
+    );
+
+    for (index, entity) in point_light_entities.iter().enumerate() {
+        let (_, main_entity, light, ..) = point_lights.get(*entity).unwrap();
+
+        let mut flags = PointLightFlags::NONE;
+        let mut shadow_map = 0;
+
+        if shadow_mapped(index, light) {
             flags |= PointLightFlags::SHADOW_MAPS_ENABLED;
+            let slots = match light.spot_light_angles {
+                Some(_) => &shadow_map_slots.spot,
+                None => &shadow_map_slots.point,
+            };
+            shadow_map = slots.get(*main_entity).map_or(0, |(slot, _)| slot);
         }
 
         if light.contact_shadows_enabled {
@@ -1568,7 +1730,7 @@ pub fn prepare_lights(
                     .xyz()
                     .extend(1.0 / (light.range * light.range)),
                 position_radius: light.transform.translation().extend(light.radius),
-                flags: flags.bits(),
+                flags: flags.bits() | shadow_map << POINT_LIGHT_SHADOW_MAP_SHIFT,
                 shadow_depth_bias: light.shadow_depth_bias,
                 shadow_normal_bias: light.shadow_normal_bias,
                 shadow_map_near_z: light.shadow_map_near_z,
@@ -1676,7 +1838,7 @@ pub fn prepare_lights(
             size: Extent3d {
                 width: point_light_shadow_map.size as u32,
                 height: point_light_shadow_map.size as u32,
-                depth_or_array_layers: point_light_shadow_maps_count.max(1) as u32 * 6,
+                depth_or_array_layers: shadow_map_slots.point.capacity().max(1) * 6,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -1726,9 +1888,9 @@ pub fn prepare_lights(
                     .min(render_device.limits().max_texture_dimension_2d),
                 height: (directional_light_shadow_map.size as u32)
                     .min(render_device.limits().max_texture_dimension_2d),
-                depth_or_array_layers: (num_directional_cascades_enabled
-                    + spot_light_shadow_maps_count)
-                    .max(1) as u32,
+                depth_or_array_layers: (num_directional_cascades_enabled as u32
+                    + shadow_map_slots.spot.capacity())
+                .max(1),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -1779,13 +1941,19 @@ pub fn prepare_lights(
             (point_light_frusta, _),
         ) = point_lights.get_mut(*light_entity).unwrap();
 
-        if !light.shadow_maps_enabled {
+        let slot = shadow_map_slots.point.get(*light_main_entity);
+        let (true, Some((slot, generation))) = (light.shadow_maps_enabled, slot) else {
             despawn_entities(
                 &mut commands,
                 mem::take(&mut point_and_spot_light_view_entities.0),
             );
             continue;
-        }
+        };
+        // Views render to their slot of this texture: made again when either
+        // is another.
+        let made_with = (generation, point_light_depth_texture.texture.id());
+        let remake =
+            shadow_views_made_with.insert(*light_main_entity, made_with) != Some(made_with);
 
         if point_and_spot_light_view_entities.0.is_empty() {
             // For each face of a cube we spawn a light entity
@@ -1794,7 +1962,7 @@ pub fn prepare_lights(
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
-                &global_clusterable_object_meta,
+                slot,
                 (
                     &cube_face_rotations,
                     point_light_frusta,
@@ -1807,12 +1975,12 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = light_view_entities;
-        } else if changed_point_lights.get(*light_entity).is_ok() {
+        } else if remake || changed_point_lights.get(*light_entity).is_ok() {
             // Update the point shadow maps with the changes.
             create_point_shadow_maps(
                 &mut commands,
                 &mut point_light_depth_attachments,
-                &global_clusterable_object_meta,
+                slot,
                 (
                     &cube_face_rotations,
                     point_light_frusta,
@@ -1839,11 +2007,10 @@ pub fn prepare_lights(
     }
 
     // spot lights
-    for (light_index, light_entity) in point_light_entities
+    for light_entity in point_light_entities
         .iter()
         .skip(point_light_count)
         .take(spot_light_count)
-        .enumerate()
     {
         let (
             _,
@@ -1854,13 +2021,17 @@ pub fn prepare_lights(
             (_, spot_light_frustum),
         ) = point_lights.get_mut(*light_entity).unwrap();
 
-        if !light.shadow_maps_enabled {
+        let slot = shadow_map_slots.spot.get(*light_main_entity);
+        let (true, Some((slot, generation))) = (light.shadow_maps_enabled, slot) else {
             despawn_entities(
                 &mut commands,
                 mem::take(&mut point_and_spot_light_view_entities.0),
             );
             continue;
-        }
+        };
+        let made_with = (generation, directional_light_depth_texture.texture.id());
+        let remake =
+            shadow_views_made_with.insert(*light_main_entity, made_with) != Some(made_with);
 
         // Spot light shadow maps are shared across all cameras,
         // so the retained view entity must not include the camera.
@@ -1872,7 +2043,7 @@ pub fn prepare_lights(
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
-                (num_directional_cascades_enabled, light_index),
+                (num_directional_cascades_enabled, slot),
                 &directional_light_depth_texture,
                 view_light_entity,
                 (light_entity, light_main_entity, light, light_render_layers),
@@ -1882,11 +2053,11 @@ pub fn prepare_lights(
             );
 
             point_and_spot_light_view_entities.0 = vec![view_light_entity];
-        } else if changed_point_lights.get(*light_entity).is_ok() {
+        } else if remake || changed_point_lights.get(*light_entity).is_ok() {
             create_spot_shadow_map(
                 &mut commands,
                 &mut directional_light_depth_attachments,
-                (num_directional_cascades_enabled, light_index),
+                (num_directional_cascades_enabled, slot),
                 &directional_light_depth_texture,
                 // There should only be one view light entity for spotlights
                 point_and_spot_light_view_entities.0[0],
@@ -1903,6 +2074,10 @@ pub fn prepare_lights(
         );
         live_shadow_mapping_lights.insert(retained_view_entity);
     }
+
+    shadow_views_made_with.retain(|light, _| {
+        shadow_map_slots.point.get(*light).is_some() || shadow_map_slots.spot.get(*light).is_some()
+    });
 
     // set up light data for each view
     for (
@@ -2044,11 +2219,9 @@ pub fn prepare_lights(
             ),
             cluster_dimensions: clusters.dimensions.extend(n_clusters),
             n_directional_lights: num_directional_lights_for_this_view as u32,
-            // spotlight shadow maps are stored in the directional light array, starting at num_directional_cascades_enabled.
-            // the spot lights themselves start in the light array at point_light_count. so to go from light
-            // index to shadow map index, we need to subtract point light count and add directional shadowmap count.
-            spot_light_shadowmap_offset: num_directional_cascades_enabled as i32
-                - point_light_count as i32,
+            // spot light shadow maps are stored in the directional light array, starting at
+            // num_directional_cascades_enabled, each in its slot of `ShadowMapSlots::spot`.
+            spot_light_shadowmap_offset: num_directional_cascades_enabled as i32,
             ambient_light_flags: ambient_light_flags.bits(),
             n_rect_lights: 0,
             rect_lights: [GpuRectLight::default(); MAX_RECT_LIGHTS],
@@ -2323,7 +2496,7 @@ pub fn prepare_lights(
 fn create_point_shadow_maps(
     commands: &mut Commands,
     point_light_depth_attachments: &mut HashMap<u32, DepthStencilViewAttachment>,
-    global_clusterable_object_meta: &ResMut<GlobalClusterableObjectMeta>,
+    slot: u32,
     (cube_face_rotations, point_light_frusta, light_view_entities): (
         &Vec<Transform>,
         Option<&CubemapFrusta>,
@@ -2339,10 +2512,6 @@ fn create_point_shadow_maps(
     point_light_shadow_map_size: u32,
     gpu_preprocessing_support_max_supported_mode: GpuPreprocessingMode,
 ) {
-    let light_index = *global_clusterable_object_meta
-        .entity_to_index
-        .get(light_entity)
-        .unwrap();
     // ignore scale because we don't want to effectively scale light radius and range
     // by applying those as a view transform to shadow map rendering of objects
     // and ignore rotation because we want the shadow map projections to align with the axes
@@ -2360,7 +2529,7 @@ fn create_point_shadow_maps(
         .zip(light_view_entities.iter().copied())
         .enumerate()
     {
-        let base_array_layer = (light_index * 6 + face_index) as u32;
+        let base_array_layer = slot * 6 + face_index as u32;
 
         let depth_attachment = point_light_depth_attachments
             .entry(base_array_layer)
@@ -2400,7 +2569,7 @@ fn create_point_shadow_maps(
                 depth_attachment,
                 pass_name: format!(
                     "shadow_point_light_{}_{}",
-                    light_index,
+                    slot,
                     face_index_to_name(face_index)
                 ),
             },
@@ -2442,7 +2611,7 @@ fn create_point_shadow_maps(
 fn create_spot_shadow_map(
     commands: &mut Commands,
     directional_light_depth_attachments: &mut HashMap<u32, DepthStencilViewAttachment>,
-    (num_directional_cascades_enabled, light_index): (usize, usize),
+    (num_directional_cascades_enabled, slot): (usize, u32),
     directional_light_depth_texture: &CachedTexture,
     view_light_entity: Entity,
     (light_entity, light_main_entity, light, light_render_layers): (
@@ -2462,7 +2631,7 @@ fn create_spot_shadow_map(
                 [point_light_count..point_light_count + spot_light_shadow_maps_count] are spot lights").1;
     let spot_projection = spot_light_clip_from_view(angle, light.shadow_map_near_z);
 
-    let base_array_layer = (num_directional_cascades_enabled + light_index) as u32;
+    let base_array_layer = num_directional_cascades_enabled as u32 + slot;
 
     let depth_attachment = directional_light_depth_attachments
         .entry(base_array_layer)
@@ -2496,7 +2665,7 @@ fn create_spot_shadow_map(
     commands.entity(view_light_entity).insert((
         ShadowView {
             depth_attachment,
-            pass_name: format!("shadow_spot_light_{light_index}"),
+            pass_name: format!("shadow_spot_light_{slot}"),
         },
         ExtractedView {
             retained_view_entity,
@@ -3349,5 +3518,84 @@ pub fn extract_shadow_lod_origin(
             render_shadow_lod_origin.0 = global_transform.translation();
         }
         None => render_shadow_lod_origin.0 = Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ShadowMapSlotAllocator, SHADOW_MAP_SLOTS_STEP};
+    use bevy_ecs::entity::Entity;
+    use bevy_render::sync_world::MainEntity;
+
+    fn lights(indices: &[u32]) -> Vec<MainEntity> {
+        indices
+            .iter()
+            .map(|&index| MainEntity::from(Entity::from_raw_u32(index).unwrap()))
+            .collect()
+    }
+
+    fn slot(slots: &ShadowMapSlotAllocator, index: u32) -> Option<u32> {
+        slots.get(lights(&[index])[0]).map(|(slot, _)| slot)
+    }
+
+    /// A light keeps its slot while the lights before it come and go.
+    #[test]
+    fn a_light_keeps_its_slot() {
+        let mut slots = ShadowMapSlotAllocator::default();
+        slots.assign(&lights(&[1, 2, 3]), 64);
+        let kept = slot(&slots, 3);
+        slots.assign(&lights(&[2, 3]), 64);
+        assert_eq!(slot(&slots, 3), kept);
+        slots.assign(&lights(&[0, 1, 2, 3]), 64);
+        assert_eq!(slot(&slots, 3), kept);
+    }
+
+    /// A light out of view keeps its slot until it is wanted, and the
+    /// longest unused is given up first.
+    #[test]
+    fn a_slot_is_kept_until_wanted() {
+        let mut slots = ShadowMapSlotAllocator::default();
+        let all: Vec<u32> = (0..SHADOW_MAP_SLOTS_STEP).collect();
+        slots.assign(&lights(&all), 64);
+        let (first, second) = (slot(&slots, 0), slot(&slots, 1));
+        // Light 0 leaves, then light 1.
+        slots.assign(&lights(&all[1..]), 64);
+        slots.assign(&lights(&all[2..]), 64);
+        assert_eq!(slot(&slots, 0), first, "nothing wanted it yet");
+        // A newcomer takes the slot unused longest: light 0's.
+        let mut with_newcomer = all[2..].to_vec();
+        with_newcomer.push(100);
+        slots.assign(&lights(&with_newcomer), 64);
+        assert_eq!(slot(&slots, 0), None);
+        assert_eq!(slot(&slots, 100), first);
+        assert_eq!(slot(&slots, 1), second);
+    }
+
+    /// The texture grows by a step at a time, never shrinks, and never
+    /// grows past what the device holds.
+    #[test]
+    fn the_texture_only_grows() {
+        let mut slots = ShadowMapSlotAllocator::default();
+        slots.assign(&lights(&[1]), 64);
+        assert_eq!(slots.capacity(), SHADOW_MAP_SLOTS_STEP);
+        let many: Vec<u32> = (0..SHADOW_MAP_SLOTS_STEP + 1).collect();
+        slots.assign(&lights(&many), 64);
+        assert_eq!(slots.capacity(), 2 * SHADOW_MAP_SLOTS_STEP);
+        slots.assign(&lights(&[1]), 64);
+        assert_eq!(slots.capacity(), 2 * SHADOW_MAP_SLOTS_STEP);
+        slots.assign(&lights(&many), 3);
+        assert_eq!(slots.capacity(), 3);
+    }
+
+    /// A slot given to another light is told apart from its last holder's.
+    #[test]
+    fn a_slot_given_again_is_another_generation() {
+        let mut slots = ShadowMapSlotAllocator::default();
+        slots.assign(&lights(&[1]), 1);
+        let before = slots.get(lights(&[1])[0]).unwrap();
+        slots.assign(&lights(&[2]), 1);
+        let after = slots.get(lights(&[2])[0]).unwrap();
+        assert_eq!(before.0, after.0);
+        assert_ne!(before.1, after.1);
     }
 }

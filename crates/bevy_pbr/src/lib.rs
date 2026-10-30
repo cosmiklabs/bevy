@@ -404,7 +404,8 @@ impl Plugin for PbrPlugin {
             )
             .init_gpu_resource::<LightMeta>()
             .init_resource::<RenderShadowLodOrigin>()
-            .init_resource::<ShadowCasterChanges>();
+            .init_resource::<ShadowCasterChanges>()
+            .init_resource::<ShadowMapSlots>();
 
         render_app
             .world_mut()
